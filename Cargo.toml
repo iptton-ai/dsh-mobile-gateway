@@ -1,0 +1,40 @@
+[package]
+name = "dsh-mobile-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "dsh_mobile_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsh-mobile-gateway"
+path = "src/main.rs"
+
+[dependencies]
+gateway-shared = { path = "shared" }
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+anyhow = "1"
+dotenvy = "0.15"
+argon2 = { version = "0.5", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+qrcode = { version = "0.13", default-features = false }
+reqwest = { version = "0.12", features = ["stream", "json"], default-features = false }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

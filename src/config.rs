@@ -8,9 +8,9 @@ pub const TUNNEL_PORT_MAX: u16 = 13199;
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// 公开监听绑定地址。默认 0.0.0.0(Docker 端口映射需要);
-    /// 裸机 + 同机 nginx 部署应设 127.0.0.1 —— 公开面只该被反代触达,
-    /// 不依赖云安全组挡直连(X-Real-IP 伪造 = 限速失效 + 明文 HTTP)。
+    /// 公开监听绑定地址。默认 127.0.0.1(fail-closed:公开面只该被同机
+    /// 反代触达;直绑 0.0.0.0 依赖云安全组挡直连,X-Real-IP 可伪造 =
+    /// 限速失效 + 明文 HTTP)。Docker 端口映射形态显式设 0.0.0.0。
     pub bind: String,
     /// 公开监听端口(nginx 反代目标)。
     pub port: u16,
@@ -37,7 +37,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         Self {
-            bind: env_or("DSH_GATEWAY_BIND", "0.0.0.0"),
+            bind: env_or("DSH_GATEWAY_BIND", "127.0.0.1"),
             port: env_parse("DSH_GATEWAY_PORT", 8102u16),
             admin_port: env_parse("DSH_GATEWAY_ADMIN_PORT", 8103u16),
             upstream_addr: env_or("DSH_GATEWAY_UPSTREAM", "127.0.0.1:13100"),

@@ -1,9 +1,18 @@
 // 上游中转:把通过鉴权的请求原样送往 dsh(经 SSH 反向隧道)。
 //
 // 两个面:
-// - 普通 HTTP(POST /api/*、GET 导出流):reqwest 流式转发,请求/响应体都不落盘。
+// - 普通 HTTP(POST /api/*、GET 导出流):hyper client conn 逐请求建连
+//   (TCP 与 Unix socket 双模),请求/响应体全程流式不落盘。
 // - WebSocket upgrade(/api/events.mux、/api/events.host):对上游手写 HTTP/1.1
 //   升级握手,拿到 101 后对下游同样回 101,之后裸管双向拷贝。
+//
+// 上游落点形态(resolve_upstream):
+// - 令牌绑定端口 N,且 DSH_GATEWAY_TUNNEL_SOCK_DIR 里存在 tunnel-N.sock →
+//   Unix socket(隧道 ssh -R 直落 socket,目录/属主权限即访问控制);
+// - 否则 TCP 127.0.0.1:N(经典 ssh -R 端口转发)。切换期双模并存,socket
+//   出现即自动采用,无需重启网关。
+// HTTP 侧逐请求建连是有意为之:回环/UDS 建连代价极小,换掉连接池复杂度;
+// 双下行 WS 本就是长连接,不受影响。
 //
 // 关键点:Host 头改写为 dsh 的 loopback authority —— dsh 的信任围栏按 Host 判定,
 // 隧道出口的 TCP 来源本就是 loopback(sshd 本地转发),Host 改写后整条链路在
@@ -14,12 +23,35 @@ use axum::{
     http::{header, HeaderName, HeaderValue, Response, StatusCode},
 };
 use hyper::upgrade::OnUpgrade;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UnixStream};
 use gateway_shared::error::{AppError, AppResult};
 
 use crate::AppState;
+
+/// 读写的合一 trait(Rust trait object 不允许多主 trait,包一层)。
+pub trait Io: AsyncRead + AsyncWrite {}
+impl<T: AsyncRead + AsyncWrite> Io for T {}
+
+/// 上游连接的装箱类型:TCP 与 Unix socket 统一。
+pub type BoxedIo = Box<dyn Io + Unpin + Send>;
+
+/// 单次请求的上游目标。
+#[derive(Clone, Debug)]
+pub enum UpstreamTarget {
+    Tcp(String),
+    Unix(PathBuf),
+}
+
+/// 目标拨号(TCP / Unix socket;HTTP 与 WS 共用)。
+async fn connect_target(target: &UpstreamTarget) -> std::io::Result<BoxedIo> {
+    match target {
+        UpstreamTarget::Tcp(addr) => Ok(Box::new(TcpStream::connect(addr).await?) as BoxedIo),
+        UpstreamTarget::Unix(path) => Ok(Box::new(UnixStream::connect(path).await?) as BoxedIo),
+    }
+}
 
 /// RFC 7230 hop-by-hop 头,转发时丢弃(帧结构由本层自建)。
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -65,13 +97,42 @@ fn relay_error(status: StatusCode, msg: &str) -> Response<Body> {
         .expect("static response")
 }
 
-/// 解析本次请求的上游:配对令牌绑定端口 → 该 Mac 的隧道口;
-/// 密码登录令牌(无绑定)→ 配置默认上游。
-fn resolve_upstream(state: &Arc<AppState>, device: &crate::auth::AuthedDevice) -> String {
+/// 解析本次请求的上游:配对令牌绑定端口 → 该 Mac 的隧道口
+/// (UDS socket 存在优先,否则 TCP);密码登录令牌(无绑定)→ 配置默认上游。
+fn resolve_upstream(state: &Arc<AppState>, device: &crate::auth::AuthedDevice) -> UpstreamTarget {
     match device.upstream_port {
-        Some(port) => format!("127.0.0.1:{port}"),
-        None => state.config.upstream_addr.clone(),
+        Some(port) => {
+            if let Some(sock) = tunnel_sock(state, port) {
+                return UpstreamTarget::Unix(sock);
+            }
+            UpstreamTarget::Tcp(format!("127.0.0.1:{port}"))
+        }
+        None => default_upstream_target(state),
     }
+}
+
+/// 端口 N 的隧道 UDS 路径(sock 目录配置了且 socket 已落地才算)。
+fn tunnel_sock(state: &Arc<AppState>, port: u16) -> Option<PathBuf> {
+    let dir = state.config.tunnel_sock_dir.as_ref()?;
+    let path = PathBuf::from(dir).join(format!("tunnel-{port}.sock"));
+    path.exists().then_some(path)
+}
+
+/// 默认上游(healthz / 无绑定令牌):upstream_addr 的端口若有对应
+/// tunnel-{N}.sock 则优先 UDS,否则按配置 TCP 直连。
+fn default_upstream_target(state: &Arc<AppState>) -> UpstreamTarget {
+    let port = state
+        .config
+        .upstream_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok());
+    if let Some(port) = port {
+        if let Some(sock) = tunnel_sock(state, port) {
+            return UpstreamTarget::Unix(sock);
+        }
+    }
+    UpstreamTarget::Tcp(state.config.upstream_addr.clone())
 }
 
 /// WS 在线计数 RAII:构造即 +1,Drop 即减(下限 0)。
@@ -133,54 +194,62 @@ pub async fn relay_handler(
     }
 }
 
-/// 普通 HTTP 流式转发。
+/// 普通 HTTP 流式转发:逐请求对上游建连(hyper client conn,TCP/UDS 双模)。
 async fn relay_http(
     state: &Arc<AppState>,
-    upstream: &str,
+    upstream: &UpstreamTarget,
     req: Request,
 ) -> AppResult<Response<Body>> {
-    let (parts, body) = req.into_parts();
-    let path = parts
+    let (mut parts, body) = req.into_parts();
+    // URI 只保留 path+query(authority 是下游侧信息,对上游无意义)。
+    parts.uri = parts
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let url = format!("http://{}{}", upstream, path);
+        .map(|pq| pq.as_str().parse().unwrap_or_default())
+        .unwrap_or_else(|| "/".parse().unwrap());
 
-    let mut out = state
-        .http
-        .request(parts.method, &url)
-        .header(header::HOST, state.config.upstream_host.as_str());
-    for (name, value) in parts.headers.iter() {
-        if is_hop_by_hop(name) {
-            continue;
-        }
-        // 网关 Bearer 令牌到此为止:dsh 围栏不消费它,透传只会把 30 天
-        // 设备令牌泄进上游进程的内存/日志。WS 路径天然不带(只转
-        // sec-websocket-* 头)。
-        if name == header::AUTHORIZATION {
-            continue;
-        }
-        out = out.header(name, value);
+    // Host 改写为 dsh 的 loopback authority;网关 Bearer 令牌到此为止:
+    // dsh 围栏不消费它,透传只会把 30 天设备令牌泄进上游进程的内存/日志。
+    // WS 路径天然不带(只转 sec-websocket-* 头)。
+    let mut out_headers = axum::http::HeaderMap::new();
+    if let Ok(hv) = HeaderValue::from_str(&state.config.upstream_host) {
+        out_headers.insert(header::HOST, hv);
     }
-    let stream = body.into_data_stream();
-    let req_body = reqwest::Body::wrap_stream(stream);
-    let out = out.body(req_body);
+    for (name, value) in parts.headers.iter() {
+        if is_hop_by_hop(name) || name == header::AUTHORIZATION {
+            continue;
+        }
+        out_headers.append(name, value.clone());
+    }
+    parts.headers = out_headers;
 
-    let resp = out.send().await.map_err(|e| {
-        AppError::Internal(anyhow::anyhow!("upstream request failed: {e}"))
-    })?;
+    // 建连 + 握手 + 发送(连接驱动任务随响应结束自然回收)。
+    let io = connect_target(upstream)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("upstream connect: {e}")))?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io))
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("upstream handshake: {e}")))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
-    let mut builder = Response::builder().status(resp.status());
-    for (name, value) in resp.headers().iter() {
+    let out = hyper::Request::from_parts(parts, body);
+    let resp = sender
+        .send_request(out)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("upstream request failed: {e}")))?;
+
+    let (resp_parts, incoming) = resp.into_parts();
+    let mut builder = Response::builder().status(resp_parts.status);
+    for (name, value) in resp_parts.headers.iter() {
         if is_hop_by_hop(name) {
             continue;
         }
         builder = builder.header(name, value);
     }
-    let body = Body::from_stream(resp.bytes_stream());
     builder
-        .body(body)
+        .body(Body::new(incoming))
         .map_err(|e| AppError::Internal(anyhow::anyhow!("response build: {e}")))
 }
 
@@ -189,7 +258,7 @@ async fn relay_http(
 /// 一切提前返回路径由 Drop 兜底减数。
 async fn relay_websocket(
     state: &Arc<AppState>,
-    upstream_addr: &str,
+    upstream: &UpstreamTarget,
     req: Request,
     presence: WsPresenceGuard,
 ) -> AppResult<Response<Body>> {
@@ -202,8 +271,8 @@ async fn relay_websocket(
     let headers = req.headers().clone();
     let on_upgrade = hyper::upgrade::on(req);
 
-    // 1. 连上游隧道口。
-    let mut upstream = TcpStream::connect(upstream_addr)
+    // 1. 连上游隧道口(TCP 或 UDS)。
+    let mut upstream = connect_target(upstream)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("upstream connect: {e}")))?;
 
@@ -306,9 +375,10 @@ async fn relay_websocket(
 
 async fn pipe_after_upgrade(
     on_upgrade: OnUpgrade,
-    mut upstream: TcpStream,
+    mut upstream: BoxedIo,
     leftover: Vec<u8>,
-    presence: WsPresenceGuard,
+    // 下划线命名:仅靠存活到任务结束持有计数(Drop 即减),不显式读取。
+    _presence: WsPresenceGuard,
 ) {
     let downstream = match on_upgrade.await {
         Ok(up) => up,
@@ -325,7 +395,7 @@ async fn pipe_after_upgrade(
             return;
         }
     }
-    // 上游 TcpStream 本就是 tokio IO,无需桥接;down 侧才需要 hyper→tokio 桥。
+    // 两侧都已适配 tokio IO,直接对拷。
     match tokio::io::copy_bidirectional(&mut down, &mut upstream).await {
         Ok(_) => tracing::debug!("ws relay: closed"),
         Err(e) => tracing::debug!("ws relay ended: {e}"),
@@ -336,9 +406,9 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-/// healthz:探测上游隧道口是否可连(不鉴权;只暴露布尔)。
+/// healthz:探测默认上游隧道口是否可连(TCP 或 UDS;不鉴权;只暴露布尔)。
 pub async fn healthz(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let upstream_ok = tokio::net::TcpStream::connect(&state.config.upstream_addr)
+    let upstream_ok = connect_target(&default_upstream_target(&state))
         .await
         .is_ok();
     let body = serde_json::json!({ "ok": true, "upstream": upstream_ok });

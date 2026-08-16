@@ -102,6 +102,8 @@ async fn spawn_all() -> TestEnv {
         upstream_host: UPSTREAM_HOST.into(),
         jwt_secret: secret.clone(),
         password_hash: hash,
+        admin_token: String::new(),
+        tunnel_sock_dir: None,
         token_ttl_days: 30,
         database_path: String::new(),
         tunnel_port_min: 1024,
@@ -113,7 +115,6 @@ async fn spawn_all() -> TestEnv {
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
         ws_sessions: Default::default(),
-        http: dsh_mobile_gateway::direct_client(),
     });
     let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_port = gateway_listener.local_addr().unwrap().port();
@@ -290,6 +291,8 @@ async fn healthz_reports_upstream() {
         upstream_host: UPSTREAM_HOST.into(),
         jwt_secret: secret,
         password_hash: hash,
+        admin_token: String::new(),
+        tunnel_sock_dir: None,
         token_ttl_days: 30,
         database_path: String::new(),
         tunnel_port_min: 1024,
@@ -301,7 +304,6 @@ async fn healthz_reports_upstream() {
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
         ws_sessions: Default::default(),
-        http: dsh_mobile_gateway::direct_client(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -449,4 +451,62 @@ async fn ws_presence_marks_token_connected() {
     let _ = ws.close(None).await;
     drop(ws);
     assert!(wait_connected(&env, &jti, false).await, "ws 断开后应离线");
+}
+
+// 管理面 bearer 校验:DSH_GATEWAY_ADMIN_TOKEN 配置后,无/错 token 一律 401,
+// 正确 token 放行(同机任意进程防线;空值 = 放行由其余既有测试覆盖)。
+#[tokio::test]
+async fn admin_routes_require_bearer_token_when_configured() {
+    let config = Config {
+        bind: "127.0.0.1".into(),
+        port: 0,
+        admin_port: 0,
+        upstream_addr: "127.0.0.1:1".into(),
+        upstream_host: UPSTREAM_HOST.into(),
+        jwt_secret: "s".into(),
+        password_hash: String::new(),
+        admin_token: "sekrit-admin-token".into(),
+        tunnel_sock_dir: None,
+        token_ttl_days: 30,
+        database_path: String::new(),
+        tunnel_port_min: 1024,
+        tunnel_port_max: 65535,
+    };
+    let state = Arc::new(AppState {
+        config,
+        db: TokenDb::open_in_memory().unwrap(),
+        login_limiter: LoginRateLimiter::new(),
+        pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
+    });
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let st = state.clone();
+    tokio::spawn(async move { axum::serve(l, build_admin_router(st)).await.unwrap(); });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/admin/pair/tokens");
+    // 无 token / 错 token → 401(两者不可区分)。
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .header("authorization", "Bearer wrong")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // 正确 token → 200(清单为空数组也算成功)。
+    let resp = client
+        .get(&url)
+        .header("authorization", "Bearer sekrit-admin-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

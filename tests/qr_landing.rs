@@ -25,6 +25,8 @@ async fn spawn_all() -> QrEnv {
         upstream_host: "127.0.0.1:3080".into(),
         jwt_secret: format!("test-secret-{}", uuid::Uuid::new_v4()),
         password_hash: String::new(),
+        admin_token: String::new(),
+        tunnel_sock_dir: None,
         token_ttl_days: 30,
         database_path: String::new(),
         tunnel_port_min: 1024,
@@ -36,7 +38,6 @@ async fn spawn_all() -> QrEnv {
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
         ws_sessions: Default::default(),
-        http: dsh_mobile_gateway::direct_client(),
     });
     let pub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let public_port = pub_listener.local_addr().unwrap().port();

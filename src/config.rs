@@ -25,6 +25,15 @@ pub struct Config {
     pub jwt_secret: String,
     /// argon2 哈希(--hash-password 生成)。空 = 密码登录禁用(仅配对)。
     pub password_hash: String,
+    /// 管理面 bearer token(DSH_GATEWAY_ADMIN_TOKEN)。非空 = 管理面所有路由
+    /// 要求 `authorization: Bearer <token>`;空 = 不鉴权(仅限本地联调 ——
+    /// 管理面虽绑 loopback,同机任意进程都能连,生产必须设置)。
+    pub admin_token: String,
+    /// 隧道 UDS 落点目录(DSH_GATEWAY_TUNNEL_SOCK_DIR,如 /run/dsh-gateway)。
+    /// 设置后,令牌绑定端口 N 的上游优先取 `{dir}/tunnel-{N}.sock`(Unix socket,
+    /// sshd 侧 `ssh -R` 直落 socket,权限由目录/属主把守);socket 不存在则
+    /// 回落 TCP 127.0.0.1:N —— 切换期/未切换的隧道双模并存。
+    pub tunnel_sock_dir: Option<String>,
     /// 设备令牌有效期(天)。
     pub token_ttl_days: i64,
     /// SQLite 数据库文件路径(令牌/配对登记表)。
@@ -44,6 +53,11 @@ impl Config {
             upstream_host: env_or("DSH_GATEWAY_UPSTREAM_HOST", "127.0.0.1:3080"),
             jwt_secret: env_required("DSH_GATEWAY_JWT_SECRET"),
             password_hash: env_or("DSH_GATEWAY_PASSWORD_HASH", ""),
+            admin_token: env_or("DSH_GATEWAY_ADMIN_TOKEN", ""),
+            tunnel_sock_dir: match env_or("DSH_GATEWAY_TUNNEL_SOCK_DIR", "") {
+                s if s.is_empty() => None,
+                s => Some(s),
+            },
             token_ttl_days: env_parse("DSH_GATEWAY_TOKEN_TTL_DAYS", 30i64),
             database_path: env_or("DSH_GATEWAY_DATABASE", "dsh-gateway.db"),
             tunnel_port_min: env_parse("DSH_GATEWAY_TUNNEL_PORT_MIN", TUNNEL_PORT_MIN),

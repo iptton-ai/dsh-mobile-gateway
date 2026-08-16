@@ -76,6 +76,8 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         upstream_host: UPSTREAM_HOST.into(),
         jwt_secret: "pair-test-secret".into(),
         password_hash: hash.clone(),
+        admin_token: String::new(),
+        tunnel_sock_dir: None,
         token_ttl_days: 30,
         database_path: String::new(),
         tunnel_port_min: 1024,
@@ -87,7 +89,6 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
         ws_sessions: Default::default(),
-        http: dsh_mobile_gateway::direct_client(),
     });
     let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let pub_port = pl.local_addr().unwrap().port();
@@ -428,4 +429,127 @@ async fn admin_status_reports_confirmation() {
     assert_eq!(status["confirmed"], true);
     assert_eq!(status["token"]["device"], "Pixel-9");
     assert_eq!(status["token"]["host_label"], "mac-mini");
+}
+
+// UDS 隧道落点:令牌绑定端口的 tunnel-{N}.sock 存在时,中转必须走 Unix
+// socket(TCP 回落指到死端口 —— 若错误回落,relay 502,测试必红)。
+#[tokio::test]
+async fn relay_prefers_unix_socket_when_present() {
+    use tokio::net::UnixListener;
+
+    const TUNNEL_PORT: u16 = 13100;
+
+    // 1. mock 上游 = UDS socket(记 Host;回自身 tag 以资断言)。
+    // 短路径:macOS 的 $TMPDIR 前缀很长,UDS 路径超 sun_path(104B)会炸。
+    let dir = std::path::PathBuf::from(format!("/tmp/dshgw-uds-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock_path = dir.join(format!("tunnel-{TUNNEL_PORT}.sock"));
+    let listener = UnixListener::bind(&sock_path).unwrap();
+    let seen_host: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sh = seen_host.clone();
+    let app = Router::new().route(
+        "/api/echo",
+        post(move |headers: HeaderMap| async move {
+            let host = headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            sh.lock().unwrap().push(host);
+            Json(serde_json::json!({ "host": "uds-upstream" }))
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+    // 2. 网关:sock 目录生效;TCP 默认上游故意指死端口。
+    let config = Config {
+        bind: "127.0.0.1".into(),
+        port: 0,
+        admin_port: 0,
+        upstream_addr: "127.0.0.1:1".into(),
+        upstream_host: UPSTREAM_HOST.into(),
+        jwt_secret: "uds-test-secret".into(),
+        password_hash: String::new(),
+        admin_token: String::new(),
+        tunnel_sock_dir: Some(dir.to_string_lossy().to_string()),
+        token_ttl_days: 30,
+        database_path: String::new(),
+        tunnel_port_min: 1024,
+        tunnel_port_max: 65535,
+    };
+    let state = Arc::new(AppState {
+        config,
+        db: TokenDb::open_in_memory().unwrap(),
+        login_limiter: LoginRateLimiter::new(),
+        pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
+    });
+    let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let pub_port = pl.local_addr().unwrap().port();
+    let st = state.clone();
+    tokio::spawn(async move { axum::serve(pl, build_public_router(st)).await.unwrap(); });
+    let al = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = al.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(al, build_admin_router(state)).await.unwrap(); });
+    let env = PairEnv {
+        pub_port,
+        admin_port,
+        upstream_ports: vec![TUNNEL_PORT],
+        password_hash: String::new(),
+    };
+
+    // 3. 完整配对(claim 绑 TUNNEL_PORT)拿令牌。
+    let (code, secret) = phone_materials(42);
+    let start: serde_json::Value = pair_start(&env, &code, &secret, "Pixel-9")
+        .await
+        .json()
+        .await
+        .unwrap();
+    let pairing_id = start["pairing_id"].as_str().unwrap().to_string();
+    admin_claim(&env, &code, "ABC234", "mac-mini", TUNNEL_PORT).await;
+    let poll: serde_json::Value = reqwest::Client::new()
+        .post(pub_url(&env, "/pair/poll"))
+        .json(&serde_json::json!({ "pairing_id": pairing_id, "secret": secret }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let offer = poll["offers"].as_array().unwrap()[0].clone();
+    let confirm: serde_json::Value = reqwest::Client::new()
+        .post(pub_url(&env, "/pair/confirm"))
+        .json(&serde_json::json!({
+            "pairing_id": pairing_id,
+            "secret": secret,
+            "claim_id": offer["claim_id"],
+            "host_code": offer["host_code"],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let token = confirm["token"].as_str().unwrap();
+
+    // 4. 经中转调用 → 必须命中 UDS 上游(否则 TCP 死端口 502)。
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{pub_port}/api/echo"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({ "x": 1 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["host"], "uds-upstream", "中转必须走 UDS 而非 TCP 回落");
+    assert!(
+        seen_host.lock().unwrap().iter().all(|h| h == UPSTREAM_HOST),
+        "Host 必须改写为 loopback authority:{:?}",
+        seen_host.lock().unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

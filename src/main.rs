@@ -46,7 +46,6 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env();
     let db = TokenDb::open(&config.database_path)?;
-    let http = dsh_mobile_gateway::direct_client();
 
     let public_addr = format!("{}:{}", config.bind, config.port);
     let admin_addr = format!("127.0.0.1:{}", config.admin_port);
@@ -64,7 +63,6 @@ async fn main() -> anyhow::Result<()> {
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
         ws_sessions: Default::default(),
-        http,
     });
 
     let public_app = build_public_router(state.clone());

@@ -18,6 +18,7 @@ struct QrEnv {
 
 async fn spawn_all() -> QrEnv {
     let config = Config {
+        bind: "127.0.0.1".into(),
         port: 0,
         admin_port: 0,
         upstream_addr: "127.0.0.1:13100".into(),
@@ -34,6 +35,7 @@ async fn spawn_all() -> QrEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
         http: dsh_mobile_gateway::direct_client(),
     });
     let pub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

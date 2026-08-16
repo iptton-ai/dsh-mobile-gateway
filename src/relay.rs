@@ -74,6 +74,35 @@ fn resolve_upstream(state: &Arc<AppState>, device: &crate::auth::AuthedDevice) -
     }
 }
 
+/// WS 在线计数 RAII:构造即 +1,Drop 即减(下限 0)。
+/// 握手失败/上游拒绝升级等提前退出同样经过 Drop,计数不会悬挂。
+struct WsPresenceGuard {
+    state: Arc<AppState>,
+    jti: String,
+}
+
+impl WsPresenceGuard {
+    fn enter(state: Arc<AppState>, jti: &str) -> Self {
+        {
+            let mut m = state.ws_sessions.lock().unwrap();
+            *m.entry(jti.to_string()).or_insert(0) += 1;
+        }
+        Self { state, jti: jti.to_string() }
+    }
+}
+
+impl Drop for WsPresenceGuard {
+    fn drop(&mut self) {
+        let mut m = self.state.ws_sessions.lock().unwrap();
+        if let Some(n) = m.get_mut(&self.jti) {
+            *n = n.saturating_sub(1);
+        }
+        if m.get(&self.jti).copied() == Some(0) {
+            m.remove(&self.jti);
+        }
+    }
+}
+
 /// 中转入口:WS upgrade 与普通 HTTP 分流。
 pub async fn relay_handler(
     State(state): State<Arc<AppState>>,
@@ -82,7 +111,10 @@ pub async fn relay_handler(
 ) -> Response<Body> {
     let upstream = resolve_upstream(&state, &device);
     if is_websocket_upgrade(&req) {
-        match relay_websocket(&state, &upstream, req).await {
+        // 计数随连接生命周期:成功路径 guard 移交 pipe 任务,断开时 Drop;
+        // 失败路径在本次调用栈内 Drop。
+        let presence = WsPresenceGuard::enter(state.clone(), &device.jti);
+        match relay_websocket(&state, &upstream, req, presence).await {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("ws relay failed: {e:#}");
@@ -123,6 +155,12 @@ async fn relay_http(
         if is_hop_by_hop(name) {
             continue;
         }
+        // 网关 Bearer 令牌到此为止:dsh 围栏不消费它,透传只会把 30 天
+        // 设备令牌泄进上游进程的内存/日志。WS 路径天然不带(只转
+        // sec-websocket-* 头)。
+        if name == header::AUTHORIZATION {
+            continue;
+        }
         out = out.header(name, value);
     }
     let stream = body.into_data_stream();
@@ -147,10 +185,13 @@ async fn relay_http(
 }
 
 /// WebSocket 双向中转:对上游手写握手,下游回 101,裸管拷贝。
+/// `presence` 随成功路径移入 pipe 任务(连接存续期间保持计数);
+/// 一切提前返回路径由 Drop 兜底减数。
 async fn relay_websocket(
     state: &Arc<AppState>,
     upstream_addr: &str,
     req: Request,
+    presence: WsPresenceGuard,
 ) -> AppResult<Response<Body>> {
     let method = req.method().clone();
     let path = req
@@ -259,11 +300,16 @@ async fn relay_websocket(
 
     // 5. 双向裸管拷贝(升级完成后 hyper 把控制权交给我们)。
     let leftover = buf[head_end + 4..].to_vec();
-    tokio::spawn(pipe_after_upgrade(on_upgrade, upstream, leftover));
+    tokio::spawn(pipe_after_upgrade(on_upgrade, upstream, leftover, presence));
     Ok(resp)
 }
 
-async fn pipe_after_upgrade(on_upgrade: OnUpgrade, mut upstream: TcpStream, leftover: Vec<u8>) {
+async fn pipe_after_upgrade(
+    on_upgrade: OnUpgrade,
+    mut upstream: TcpStream,
+    leftover: Vec<u8>,
+    presence: WsPresenceGuard,
+) {
     let downstream = match on_upgrade.await {
         Ok(up) => up,
         Err(e) => {

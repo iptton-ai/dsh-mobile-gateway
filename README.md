@@ -38,6 +38,7 @@ docker compose up -d                # :8102 公开 / :8103 管理面(仅容器�
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `DSH_GATEWAY_JWT_SECRET` | 令牌签名密钥(必填) | — |
+| `DSH_GATEWAY_BIND` | 公开面绑定地址;裸机 + 同机 nginx 应设 127.0.0.1 | 0.0.0.0 |
 | `DSH_GATEWAY_UPSTREAM` | 默认上游(SSH 隧道落地口) | 127.0.0.1:13100 |
 | `DSH_GATEWAY_UPSTREAM_HOST` | 转发改写的 Host(dsh 信任围栏要求 loopback) | 127.0.0.1:3080 |
 | `DSH_GATEWAY_TUNNEL_PORT_MIN/MAX` | 配对 claim 允许的隧道端口段 | 13100–13199 |
@@ -59,7 +60,7 @@ Mac 上装 [dsh-mobile](https://github.com/iptton-ai/dsh-mobile) 插件(dsh web 
 ## 开发
 
 ```bash
-cargo test          # 17 项集成测试(配对/中转/Host 改写/WS/QR/限速)
+cargo test          # 19 项集成测试(配对/中转/Host 改写/WS/QR/限速/body 分层)
 ```
 
 MIT License.

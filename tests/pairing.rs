@@ -69,6 +69,7 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         String::new()
     };
     let config = Config {
+        bind: "127.0.0.1".into(),
         port: 0,
         admin_port: 0,
         upstream_addr: format!("127.0.0.1:{}", upstream_ports[0]),
@@ -85,6 +86,7 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
         http: dsh_mobile_gateway::direct_client(),
     });
     let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();

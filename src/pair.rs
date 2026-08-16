@@ -344,14 +344,25 @@ pub async fn admin_status_handler(
 }
 
 /// 管理面令牌清单(pair.sh 异常撤销提示的可操作化)。
+/// 每行附 `connected`:该令牌当前是否持有下行 WS(在线)—— 侧栏在线指示器数据源。
 pub async fn admin_tokens_handler(
     State(state): State<Arc<AppState>>,
-) -> AppResult<Json<Vec<crate::db::TokenRow>>> {
+) -> AppResult<Json<serde_json::Value>> {
     let rows = state
         .db
         .list()
         .map_err(|e| AppError::Internal(anyhow::anyhow!("db list: {e}")))?;
-    Ok(Json(rows))
+    let online = state.ws_online();
+    let out = rows
+        .into_iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(&r)
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("serialize token: {e}")))?;
+            v["connected"] = serde_json::Value::Bool(online.contains(&r.jti));
+            Ok(v)
+        })
+        .collect::<Result<Vec<_>, AppError>>()?;
+    Ok(Json(serde_json::Value::Array(out)))
 }
 
 // ── 扫码配对(M6.2):终端 QR(管理面)+ 系统相机落地页(公开面) ────────────

@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use axum::{
     extract::DefaultBodyLimit,
-    http::Method,
     middleware,
     routing::{get, post},
     Router,
@@ -33,6 +32,23 @@ pub struct AppState {
     /// 配对面限速(与登录独立计数)。
     pub pair_limiter: LoginRateLimiter,
     pub http: reqwest::Client,
+    /// 在线计数:jti → 当前持有的下行 WS 条数。RAII 增减见 relay.rs;
+    /// admin/pair/tokens 的 `connected` 字段以此为准(App 前台在线/
+    /// 后台挂起离线)。
+    pub ws_sessions: std::sync::Mutex<std::collections::HashMap<String, u32>>,
+}
+
+impl AppState {
+    /// 当前在线(持有 ≥1 条下行 WS)的令牌 jti 集合。
+    pub fn ws_online(&self) -> Vec<String> {
+        self.ws_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, &n)| n > 0)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
 }
 
 /// 上游恒为 loopback(本机隧道口),永远直连 —— 显式忽略 http_proxy 等环境变量,
@@ -67,18 +83,18 @@ pub fn build_public_router(state: Arc<AppState>) -> Router {
             auth::auth_middleware,
         ));
 
+    // 公开面 body 收紧:配对/登录载荷只有几 KB,未鉴权可达的接口不得
+    // 与中转共享 160 MiB 大口子(Json 提取器会全量缓冲进内存)。
+    // 同类型 limit 扩展以内层为准 —— 覆盖语义有 integration 测试钉死。
+    let public_routes = public_routes.layer(DefaultBodyLimit::max(64 * 1024));
+
     public_routes
         .merge(protected_routes)
-        // 请求体上限对齐 dsh 默认(160 MiB,为聚合图片 base64 留余量)。
+        // 中转请求体上限对齐 dsh 默认(160 MiB,为聚合图片 base64 留余量)。
         .layer(DefaultBodyLimit::max(160 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
-        // CORS:原生 App 客户端不带 Origin;这里给浏览器端调试留基本放行。
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_methods([Method::GET, Method::POST])
-                .allow_headers(tower_http::cors::Any)
-                .allow_origin(tower_http::cors::Any),
-        )
+        // 无 CORS 层:原生 App 不发 Origin,浏览器同源(/pair 落地页)也不
+        // 需要;显式放行 any-origin + any-headers 是给未来 web 客户端埋雷。
         .with_state(state)
 }
 

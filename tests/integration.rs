@@ -8,6 +8,7 @@ use axum::{
 };
 use dsh_mobile_gateway::{
     auth::LoginRateLimiter,
+    build_admin_router,
     build_public_router,
     config::Config,
     db::TokenDb,
@@ -23,6 +24,7 @@ const UPSTREAM_HOST: &str = "127.0.0.1:3080";
 
 struct TestEnv {
     gateway_port: u16,
+    admin_port: u16,
     upstream_port: u16,
     #[allow(dead_code)]
     secret: String,
@@ -43,8 +45,10 @@ async fn spawn_all() -> TestEnv {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("<none>")
                     .to_string();
+                // 上游不该看到网关的 Bearer 令牌(relay 转发前剥除)。
+                let auth_seen = headers.contains_key("authorization");
                 sh.lock().unwrap().push(host.clone());
-                Json(serde_json::json!({ "host": host, "body": body }))
+                Json(serde_json::json!({ "host": host, "auth_seen": auth_seen, "body": body }))
             }),
         )
         .route(
@@ -91,6 +95,7 @@ async fn spawn_all() -> TestEnv {
             .to_string()
     };
     let config = Config {
+        bind: "127.0.0.1".into(),
         port: 0,
         admin_port: 0,
         upstream_addr: format!("127.0.0.1:{upstream_port}"),
@@ -107,15 +112,22 @@ async fn spawn_all() -> TestEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
         http: dsh_mobile_gateway::direct_client(),
     });
     let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let gateway_port = gateway_listener.local_addr().unwrap().port();
+    let pub_state = state.clone();
     tokio::spawn(async move {
-        axum::serve(gateway_listener, build_public_router(state)).await.unwrap();
+        axum::serve(gateway_listener, build_public_router(pub_state)).await.unwrap();
+    });
+    let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = admin_listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(admin_listener, build_admin_router(state)).await.unwrap();
     });
 
-    TestEnv { gateway_port, upstream_port, secret, seen_hosts }
+    TestEnv { gateway_port, admin_port, upstream_port, secret, seen_hosts }
 }
 
 fn gateway_url(env: &TestEnv, path: &str) -> String {
@@ -172,6 +184,8 @@ async fn relay_requires_bearer_and_rewrites_host() {
     let body: serde_json::Value = resp.json().await.unwrap();
     // Host 改写 = dsh 信任围栏所要求的 loopback authority。
     assert_eq!(body["host"].as_str().unwrap(), UPSTREAM_HOST);
+    // 网关 Bearer 令牌不得透传到上游。
+    assert_eq!(body["auth_seen"], false);
     assert_eq!(body["body"].as_str().unwrap(), "{\"hello\":\"world\"}");
 }
 
@@ -269,6 +283,7 @@ async fn healthz_reports_upstream() {
             .to_string()
     };
     let config = Config {
+        bind: "127.0.0.1".into(),
         port: 0,
         admin_port: 0,
         upstream_addr: "127.0.0.1:1".into(),
@@ -285,6 +300,7 @@ async fn healthz_reports_upstream() {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        ws_sessions: Default::default(),
         http: dsh_mobile_gateway::direct_client(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -318,4 +334,119 @@ async fn login_rate_limited_after_burst() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+/// 公开面(未鉴权路由)body 上限收紧到 64KiB,中转面仍按 160MiB 放行 ——
+/// 钉死「内层 limit 覆盖合并层」的分层语义。
+#[tokio::test]
+async fn public_routes_body_limit_small_relay_stays_large() {
+    let env = spawn_all().await;
+    let client = reqwest::Client::new();
+    let big = "a".repeat(100 * 1024);
+
+    // 未鉴权公开路由:>64KiB → 413。
+    let resp = client
+        .post(gateway_url(&env, "/pair/poll"))
+        .header("content-type", "application/json")
+        .body(big.as_bytes().to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 中转 fallback:100KiB 远小于 160MiB → 正常到达上游。
+    let token = login(&env, PASSWORD).await.unwrap();
+    let resp = client
+        .post(gateway_url(&env, "/api/echo"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(big.into_bytes())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// 网关不再挂 CORS 层:任何 Origin 都得不到 Access-Control-Allow-Origin。
+#[tokio::test]
+async fn no_cors_allow_origin_header() {
+    let env = spawn_all().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(gateway_url(&env, "/healthz"))
+        .header("origin", "https://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+}
+
+// ── WS 在线计数(第三十八轮侧栏在线指示器的服务端数据源)───────────────────
+
+async fn admin_tokens(env: &TestEnv) -> Vec<serde_json::Value> {
+    let client = reqwest::Client::new();
+    client
+        .get(format!("http://127.0.0.1:{}/admin/pair/tokens", env.admin_port))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// 轮询等 connected 到达期望值(断开归零是异步的)。
+async fn wait_connected(env: &TestEnv, jti: &str, want: bool) -> bool {
+    for _ in 0..50 {
+        if admin_tokens(env)
+            .await
+            .iter()
+            .any(|t| t["jti"] == jti && t["connected"] == want)
+        {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// 下行 WS 建立 → admin/pair/tokens 该令牌 connected=true;
+/// 断开 → 异步归零 false。
+#[tokio::test]
+async fn ws_presence_marks_token_connected() {
+    let env = spawn_all().await;
+    let client = reqwest::Client::new();
+    let token = login(&env, PASSWORD).await.unwrap();
+    let devices: serde_json::Value = client
+        .get(gateway_url(&env, "/auth/devices"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let jti = devices[0]["jti"].as_str().unwrap().to_string();
+
+    // 尚无 WS → 不在线。
+    assert!(wait_connected(&env, &jti, false).await);
+
+    // 建立下行 WS(带 Bearer 过鉴权中转)→ 在线。
+    let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+        format!("ws://127.0.0.1:{}/api/events.mux", env.gateway_port).as_str(),
+    )
+    .unwrap();
+    req.headers_mut().insert(
+        "authorization",
+        format!("Bearer {token}").parse().unwrap(),
+    );
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert!(wait_connected(&env, &jti, true).await, "ws 建立后应在线");
+
+    // 断开 → 异步归零。
+    let _ = ws.close(None).await;
+    drop(ws);
+    assert!(wait_connected(&env, &jti, false).await, "ws 断开后应离线");
 }

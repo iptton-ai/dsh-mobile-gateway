@@ -149,6 +149,20 @@ pub fn build_web_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// 免鉴权静态 GET 白名单:浏览器 credentialless 怪癖(Chrome manifest 请求
+/// 默认不携带 cookie,即便同源;favicon 同族)。均非敏感静态资源,放行无害。
+const PUBLIC_GET_PATHS: &[&str] = &["/manifest.webmanifest", "/favicon.ico"];
+
+/// 远程封禁区:宿主侧管理面(dsh-mobile 插件的 /pair/* —— 配对/令牌/Web 密码
+/// 管理)。Host 改写给它们披上了 loopback 外衣,宿主围栏拦不住;web 面持有者
+/// 若能触达 = 可配对新设备/改 Web 密码(击穿信任根),必须网关侧封死。
+/// 本机(loopback 直连 dsh)不受影响。
+const BLOCKED_PREFIXES: &[&str] = &["/pair"];
+
+fn path_of(req: &Request) -> String {
+    req.uri().path().to_string()
+}
+
 /// 登录页(网关自渲染,内联自足,无外部资产)。已登录则直接回首页。
 async fn login_page(
     State(state): State<Arc<AppState>>,
@@ -252,8 +266,28 @@ async fn web_relay(
     State(state): State<Arc<AppState>>,
     mut req: Request,
 ) -> Response {
+    // 管理面封禁优先于一切(含未登录流量):不探测、不放行,恒 403。
+    let path = path_of(&req);
+    if BLOCKED_PREFIXES.iter().any(|p| path == *p || path.starts_with(&format!("{p}/"))) {
+        return (
+            StatusCode::FORBIDDEN,
+            "host management plane is not reachable through the web face",
+        )
+            .into_response();
+    }
     if web_creds(&state).is_none() {
         return not_enabled();
+    }
+    // credentialless 静态 GET:无会话也放行(manifest/favicon,见白名单注释)。
+    if *req.method() == axum::http::Method::GET && PUBLIC_GET_PATHS.contains(&path.as_str()) {
+        req.headers_mut().remove(header::COOKIE);
+        req.headers_mut().remove(header::AUTHORIZATION);
+        let device = AuthedDevice {
+            jti: "web-anon".into(),
+            device: "web".into(),
+            upstream_port: state.config.web_upstream_port,
+        };
+        return relay::relay_handler(State(state), device, req).await;
     }
     let session = match verify_session(&state, req.headers()) {
         Some(s) => s,

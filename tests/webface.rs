@@ -66,6 +66,10 @@ async fn spawn_env(web_hostname: &str, password_hash: &str) -> TestEnv {
             }),
         )
         .route(
+            "/manifest.webmanifest",
+            any(|| async { ([("content-type", "application/manifest+json")], "{}") }),
+        )
+        .route(
             "/static/logo.png",
             any(|| async { ([("content-type", "image/png")], b"fake-png-bytes") }),
         )
@@ -449,4 +453,41 @@ async fn app_api_unaffected_by_web_face() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["token"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn management_plane_blocked() {
+    // 宿主管理面(/pair/*:配对/令牌/Web 密码)不得经 web 面触达 —— 未登录、
+    // 已登录一律 403(Host 改写会骗过宿主 loopback 围栏,必须网关封)。
+    let env = spawn_env(WEB_HOST, &argon_hash(PASSWORD)).await;
+    let client = http_client();
+    for (method, path) in [
+        ("GET", "/pair/api/tokens"),
+        ("POST", "/pair/api/web-password"),
+        ("GET", "/pair/api/label"),
+        ("POST", "/pair/api/revoke"),
+        ("GET", "/pair"),
+    ] {
+        let resp = client
+            .request(reqwest::Method::from_bytes(method.as_bytes()).unwrap(), web_url(&env, path))
+            .header("cookie", "dshweb=whatever")
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}
+
+#[tokio::test]
+async fn manifest_fetched_without_cookie() {
+    // Chrome 怪癖:manifest 请求默认不带 cookie —— 免鉴权放行该静态 GET,
+    // 否则已登录页面的 PWA manifest 也 401 刷屏。
+    let env = spawn_env(WEB_HOST, &argon_hash(PASSWORD)).await;
+    let client = http_client();
+    let resp = client.get(web_url(&env, "/manifest.webmanifest")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // 白名单之外的无 cookie GET 不放行。
+    let resp = client.get(web_url(&env, "/static/logo.png")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

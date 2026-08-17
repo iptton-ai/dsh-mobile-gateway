@@ -73,6 +73,7 @@ impl TokenDb {
     fn migrate(conn: Connection) -> rusqlite::Result<Self> {
         conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
         conn.execute_batch(include_str!("../migrations/002_pairing.sql"))?;
+        conn.execute_batch(include_str!("../migrations/003_web.sql"))?;
         // 001 的旧 tokens 表升级(已存在的部署):补列。幂等。
         ensure_column(&conn, "tokens", "upstream_port", "INTEGER")?;
         ensure_column(&conn, "tokens", "host_label", "TEXT NOT NULL DEFAULT ''")?;
@@ -363,6 +364,48 @@ impl TokenDb {
             .optional()
             .ok()
             .flatten()
+    }
+
+    // ── web_password(Web 面登录密码)──────────────────────────────────
+
+    /// 当前 web 面密码哈希与版本号;未设置返回 None。
+    pub fn web_password(&self) -> Option<(String, i64)> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT hash, version FROM web_password WHERE id = 1",
+                [],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// 写入/更新 web 面密码哈希;版本号自增(旧会话签名失效)。返回新版本。
+    pub fn set_web_password(&self, hash: &str) -> rusqlite::Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_password (id, hash, version, updated_at) VALUES (1, ?1, 1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET hash = ?1, \
+             version = version + 1, updated_at = ?2",
+            params![hash, now()],
+        )?;
+        Ok(conn.query_row(
+            "SELECT version FROM web_password WHERE id = 1",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+    }
+
+    /// 清除 web 面密码(整行删除 = 关闭登录)。
+    pub fn clear_web_password(&self) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM web_password WHERE id = 1", [])?;
+        Ok(())
     }
 }
 

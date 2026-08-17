@@ -108,6 +108,11 @@ async fn spawn_all() -> TestEnv {
         database_path: String::new(),
         tunnel_port_min: 1024,
         tunnel_port_max: 65535,
+        web_hostname: String::new(),
+        web_bind: "127.0.0.1".into(),
+        web_port: 0,
+        web_password_hash: String::new(),
+        web_upstream_port: None,
     };
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -297,6 +302,11 @@ async fn healthz_reports_upstream() {
         database_path: String::new(),
         tunnel_port_min: 1024,
         tunnel_port_max: 65535,
+        web_hostname: String::new(),
+        web_bind: "127.0.0.1".into(),
+        web_port: 0,
+        web_password_hash: String::new(),
+        web_upstream_port: None,
     };
     let state = Arc::new(AppState {
         config,
@@ -471,6 +481,11 @@ async fn admin_routes_require_bearer_token_when_configured() {
         database_path: String::new(),
         tunnel_port_min: 1024,
         tunnel_port_max: 65535,
+        web_hostname: String::new(),
+        web_bind: "127.0.0.1".into(),
+        web_port: 0,
+        web_password_hash: String::new(),
+        web_upstream_port: None,
     };
     let state = Arc::new(AppState {
         config,

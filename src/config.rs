@@ -41,6 +41,21 @@ pub struct Config {
     /// claim 端口白名单(测试放宽;生产默认 13100–13199)。
     pub tunnel_port_min: u16,
     pub tunnel_port_max: u16,
+    /// Web 面公网主机名(DSH_GATEWAY_WEB_HOSTNAME,如 web.example.com,不带
+    /// scheme/端口)。仅用于 CSRF 门比对 Origin 与登录页自述 —— 流量分流由
+    /// nginx server_name 完成,网关不做 Host 路由。
+    pub web_hostname: String,
+    /// Web 面监听绑定(DSH_GATEWAY_WEB_BIND,默认 127.0.0.1;与 nginx 同机)。
+    pub web_bind: String,
+    /// Web 面监听端口(DSH_GATEWAY_WEB_PORT,默认 8104;0 = 不监听 = 关闭)。
+    pub web_port: u16,
+    /// Web 面登录密码 argon2 哈希的 env 兜底(DSH_GATEWAY_WEB_PASSWORD_HASH)。
+    /// 首选 DB(web_password 表,经管理面 `web.setPassword` 写入,密码轮换
+    /// 免登录服务器);DB 与 env 都空 = web 面登录禁用(全部 404)。
+    pub web_password_hash: String,
+    /// Web 面中转钉住的隧道端口(DSH_GATEWAY_WEB_UPSTREAM_PORT)。空 = 默认
+    /// 上游(upstream_addr)。web 会话与设备令牌是独立凭证,各绑各的上游。
+    pub web_upstream_port: Option<u16>,
 }
 
 impl Config {
@@ -62,6 +77,14 @@ impl Config {
             database_path: env_or("DSH_GATEWAY_DATABASE", "dsh-gateway.db"),
             tunnel_port_min: env_parse("DSH_GATEWAY_TUNNEL_PORT_MIN", TUNNEL_PORT_MIN),
             tunnel_port_max: env_parse("DSH_GATEWAY_TUNNEL_PORT_MAX", TUNNEL_PORT_MAX),
+            web_hostname: env_or("DSH_GATEWAY_WEB_HOSTNAME", "").to_lowercase(),
+            web_bind: env_or("DSH_GATEWAY_WEB_BIND", "127.0.0.1"),
+            web_port: env_parse("DSH_GATEWAY_WEB_PORT", 8104u16),
+            web_password_hash: env_or("DSH_GATEWAY_WEB_PASSWORD_HASH", ""),
+            web_upstream_port: match env_or("DSH_GATEWAY_WEB_UPSTREAM_PORT", "") {
+                s if s.is_empty() => None,
+                s => s.parse().ok(),
+            },
         }
     }
 

@@ -1,0 +1,47 @@
+# Web 面 nginx 样例:浏览器远程访问 dsh web(设计:docs/REMOTE-WEB-ACCESS.md)
+#
+# 前提:网关 env 配置(重启生效)
+#   DSH_GATEWAY_WEB_HOSTNAME=web.example.com   # 公网主机名(CSRF Origin 比对)
+#   DSH_GATEWAY_WEB_PORT=8104                  # 默认 8104,与 App 公开面(8102)分离
+#   # 密码不入 env:经 dsh-mobile 插件「移动接入」dialog 推送(管理面落 DB)
+#
+# DNS:web.example.com A 记录 → 本服务器;证书同 existing 通配/单证书。
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name web.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name web.example.com;
+
+    ssl_certificate     /path/to/fullchain.cer;
+    ssl_certificate_key /path/to/key;
+
+    # 封堵首访明文降级(SSL-strip):浏览器记忆强制 https。
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8104;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;        # WS upgrade(dsh web 事件流)
+        proxy_set_header Connection $connection_upgrade;
+        proxy_set_header Host $host;                    # 网关按 Host 透传/日志
+        proxy_set_header X-Real-IP $remote_addr;        # 网关登录限速按此计 IP
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # WS 空闲长连:dsh web 事件流常态静默,60s 默认必掐(与 App 面同参)。
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        # 流式响应透传(SSE/流式渲染)。
+        proxy_buffering off;
+    }
+}

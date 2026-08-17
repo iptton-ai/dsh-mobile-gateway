@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod pair;
 pub mod relay;
+pub mod web;
 
 use std::sync::Arc;
 
@@ -140,10 +141,21 @@ pub fn build_admin_router(state: Arc<AppState>) -> Router {
         .route("/admin/pair/revoke-token", post(pair::admin_revoke_token_handler))
         .route("/admin/pair/tokens", get(pair::admin_tokens_handler))
         .route("/admin/pair/qr", post(pair::admin_qr_handler))
+        // Web 面密码管理(明文/hashing 经 ssh 通道来;dsh-mobile 插件调用)。
+        .route(
+            "/admin/web/password",
+            get(web::admin_web_password_get).post(web::admin_web_password_post),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Web 面(独立监听 web_bind:web_port;nginx 按 server_name 分流到此)。
+/// 登录页 + cookie 会话 + 复用 relay 中转;密码未配置时全路由 404(fail-closed)。
+pub fn build_web_router(state: Arc<AppState>) -> Router {
+    web::build_web_router(state)
 }

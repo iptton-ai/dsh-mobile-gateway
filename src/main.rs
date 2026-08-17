@@ -13,6 +13,7 @@ use dsh_mobile_gateway::{
     auth::LoginRateLimiter,
     build_admin_router,
     build_public_router,
+    build_web_router,
     config::Config,
     db::TokenDb,
     AppState,
@@ -66,7 +67,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let public_app = build_public_router(state.clone());
-    let admin_app = build_admin_router(state);
+    let admin_app = build_admin_router(state.clone());
+    let web_app = build_web_router(state);
 
     let public_listener = match tokio::net::TcpListener::bind(&public_addr).await {
         Ok(l) => l,
@@ -83,12 +85,25 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 公开与管理两个 serve 并行;任一退出即整体退出(systemd 拉起)。
-    let (a, b) = tokio::join!(
+    // Web 面(独立监听;nginx 按 server_name 分流到此)。未启用时仍监听但
+    // 全路由 404(fail-closed),避免 nginx 侧配置先行时打到空端口。
+    let web_addr = format!("{}:{}", config.web_bind, config.web_port);
+    let web_listener = match tokio::net::TcpListener::bind(&web_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!("Web 面端口绑定失败 {web_addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // 三个 serve 并行;任一退出即整体退出(systemd 拉起)。
+    let (a, b, c) = tokio::join!(
         axum::serve(public_listener, public_app),
-        axum::serve(admin_listener, admin_app)
+        axum::serve(admin_listener, admin_app),
+        axum::serve(web_listener, web_app)
     );
     a?;
     b?;
+    c?;
     Ok(())
 }

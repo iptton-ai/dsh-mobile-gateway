@@ -82,6 +82,11 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         database_path: String::new(),
         tunnel_port_min: 1024,
         tunnel_port_max: 65535,
+        web_hostname: String::new(),
+        web_bind: "127.0.0.1".into(),
+        web_port: 0,
+        web_password_hash: String::new(),
+        web_upstream_port: None,
     };
     let state = Arc::new(AppState {
         config,
@@ -476,6 +481,11 @@ async fn relay_prefers_unix_socket_when_present() {
         database_path: String::new(),
         tunnel_port_min: 1024,
         tunnel_port_max: 65535,
+        web_hostname: String::new(),
+        web_bind: "127.0.0.1".into(),
+        web_port: 0,
+        web_password_hash: String::new(),
+        web_upstream_port: None,
     };
     let state = Arc::new(AppState {
         config,

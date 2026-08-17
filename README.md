@@ -44,6 +44,26 @@ docker compose up -d                # :8102 公开 / :8103 管理面(仅容器�
 | `DSH_GATEWAY_TUNNEL_PORT_MIN/MAX` | 配对 claim 允许的隧道端口段 | 13100–13199 |
 | `DSH_GATEWAY_PASSWORD_HASH` | 可选密码兜底(`--hash-password` 生成) | 空=仅配对 |
 
+## Web 面(浏览器远程访问 dsh web)
+
+独立监听口(默认 `127.0.0.1:8104`,nginx 按 server_name 分流;样例
+[deploy/nginx-web.conf.example](deploy/nginx-web.conf.example)):密码登录页
+(argon2)→ HttpOnly 签名 cookie(12h,SameSite=Strict)→ 复用中转管道到达
+dsh(Host 改写 loopback 语义同 App 面)。dsh web 零改动、与 App 令牌体系
+完全独立。详见客户端仓库 `docs/REMOTE-WEB-ACCESS.md`。
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `DSH_GATEWAY_WEB_HOSTNAME` | Web 面公网主机名(CSRF Origin 比对) | 空 |
+| `DSH_GATEWAY_WEB_BIND` / `DSH_GATEWAY_WEB_PORT` | Web 面监听 | 127.0.0.1 / 8104 |
+| `DSH_GATEWAY_WEB_PASSWORD_HASH` | argon2 哈希 env 兜底;首选 DB | 空=仅 DB |
+| `DSH_GATEWAY_WEB_UPSTREAM_PORT` | Web 面钉住的隧道端口 | 默认上游 |
+
+密码管理走管理面 `/admin/web/password`(GET 状态 / POST `{password}` 明文
+或 `{hash}` / `{clear:true}` 关闭)—— 经 ssh 调用,Mac 侧 dsh-mobile 插件
+「移动接入」dialog 可直接改密,改密即全量旧会话失效(版本号入签名域)。
+未配密码时 Web 面全路由 404(fail-closed)。
+
 ## 配对流程
 
 Mac 上装 [dsh-mobile](https://github.com/iptton-ai/dsh-mobile) 插件(dsh web GUI 内

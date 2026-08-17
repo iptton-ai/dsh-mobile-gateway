@@ -61,6 +61,7 @@ async fn spawn_env(web_hostname: &str, password_hash: &str) -> TestEnv {
                     "host": host,
                     "auth_seen": headers.contains_key("authorization"),
                     "cookie_seen": headers.contains_key("cookie"),
+                    "origin_seen": headers.contains_key("origin"),
                     "body": body,
                 }))
             }),
@@ -286,10 +287,13 @@ async fn login_flow_and_relay() {
     assert!(cookie.contains("HttpOnly"));
     assert!(cookie.contains("SameSite=Strict"));
 
-    // 6. 带 cookie 中转:Host 改写 + 凭证不进上游。
+    // 6. 带 cookie 中转:Host 改写 + 凭证与 Origin 均不进上游
+    //    (dsh 围栏要求 Origin == 自身 Host,带着必 403;网关代传会话已自校)。
     let resp = client
         .post(web_url(&env, "/api/echo"))
         .header("cookie", cookie_only(&cookie))
+        .header("origin", format!("https://{WEB_HOST}"))
+        .header("sec-fetch-site", "same-origin")
         .body("hello")
         .send()
         .await
@@ -299,6 +303,7 @@ async fn login_flow_and_relay() {
     assert_eq!(body["host"], UPSTREAM_HOST);
     assert_eq!(body["auth_seen"], false);
     assert_eq!(body["cookie_seen"], false);
+    assert_eq!(body["origin_seen"], false);
     assert_eq!(body["body"], "hello");
 
     // 7. 静态资源同样带 cookie 畅通。

@@ -297,9 +297,16 @@ async fn web_relay(
     if !method_safe && is_cross_origin(&state, req.headers()) {
         return (StatusCode::FORBIDDEN, "cross-origin request rejected").into_response();
     }
-    // 剥会话/凭证头:cookie 到网关为止(与 App Bearer 令牌同款语义)。
+    // 剥会话/凭证/浏览器来源头:cookie 到网关为止(与 App Bearer 令牌同款
+    // 语义);Origin 描述的是「浏览器→网关」关系,而 dsh 围栏要求 Origin ==
+    // 请求自身 Host(网关已改写为 loopback),带着必 403 —— 网关已在自己的
+    // CSRF 门完成同源校验,转发放行即“网关发起的请求”(App 原生客户端无
+    // Origin,同款语义)。Sec-Fetch-Site 同理不代传(cross-site 标记会让
+    // 上游围栏误拒;same-origin 缺失无损 —— 围栏只拒绝显式 cross-site)。
     req.headers_mut().remove(header::COOKIE);
     req.headers_mut().remove(header::AUTHORIZATION);
+    req.headers_mut().remove(header::ORIGIN);
+    req.headers_mut().remove("sec-fetch-site");
     let device = AuthedDevice {
         jti: session.0,
         device: "web".into(),

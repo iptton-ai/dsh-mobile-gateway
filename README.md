@@ -84,3 +84,57 @@ cargo test          # 19 项集成测试(配对/中转/Host 改写/WS/QR/限速/
 ```
 
 MIT License.
+## 多宿主 / 多租户(004 迁移,2026-08-18)
+
+一个网关实例可服务 **N 台 dsh 宿主**(同一运营者)与 **多个租户**(各自
+拥有互不相交的宿主集合)。旧单运营者部署零迁移:未登记租户时公开面
+`/admin/*` 恒 401,行为与 004 之前完全一致。
+
+### 信任模型
+
+- **运营者**(`default` 租户,不出现在 tenants 表):管理面 :8103
+  (loopback + env token / ssh)—— 跨租户超管,可建租户、登记宿主、吊销任意令牌;
+- **显式租户**(tenants 表 + 独立管理密钥):经**公开面** `/admin/*`
+  以 `Authorization: Bearer <租户密钥>` 访问,claim/status/tokens/revoke
+  全部围栏在本租户(限速 300 次/5min/IP,密钥 sha256 入库、明文只在创建
+  响应出现一次)。
+
+### 运营者管理面(仅 :8103)
+
+```
+POST /admin/tenants           {name}          → {id, admin_key}(密钥只回显一次)
+GET  /admin/tenants                           → 租户清单
+POST /admin/tenants/revoke    {id}            → 吊销租户(其密钥即刻失效)
+POST /admin/hosts             {tenant_id, port, label}  → 宿主登记(端口全局唯一)
+GET  /admin/hosts                             → 宿主清单
+POST /admin/hosts/remove      {id}            → 删除登记(端口回到未登记态)
+```
+
+### 宿主端口归属仲裁(claim)
+
+- 端口**已登记**:必须归属当前租户且启用,否则 403(撞端口=流量串台,
+  登记表是唯一仲裁者 —— 显式租户不能 claim 别家端口);
+- 端口**未登记**:仅运营者/default 沿用范围白名单(13100–13199,
+  单运营者旧语义);显式租户必须先登记宿主,否则 403;
+- 配对可带租户锚定(QR 邀请 `t=` → `/pair/start` 的 `tenant` 字段):
+  跨租户 claim 按「无人在等」404 拒绝,poll 只显示该租户的 offers;
+  开放配对(手输)靠手机端人工核对主机码把关,confirm 再做一次租户一致性
+  深度防御。
+
+### 租户数据面与设备端点围栏
+
+- `/auth/devices` 只列本租户令牌;`/auth/revoke` 只能吊销本租户 jti
+  (跨租户/未知同样返回 `revoked:false`,不给探测面);
+- `/pair/confirm` 响应新增 `host_ref`(隧道端口字符串):App 主机簿复合键,
+  同网关多宿主 = 不同条目;
+- 租户的 Mac 侧数据隧道仍是 `ssh -R`(推荐每租户一个受限 ssh 账号 +
+  sshd `Match` 块 `PermitListen` 钉死本宿主端口);控制面可走公开面
+  HTTPS 直连(dsh-mobile 插件配 `adminUrl` + 租户密钥,免 ssh)。
+
+### 已知边界(有意保留)
+
+- Web 面(:8104)仍为运营者单宿主形态(`DSH_GATEWAY_WEB_UPSTREAM_PORT`
+  钉死单端口);多租户 Web 面待后续按需开发;
+- 密码登录令牌恒属 default 租户(多租户部署建议禁用密码登录);
+- 131xx 端口本身的最终防线是服务器 ssh 层:能 bind 端口的进程即上游 ——
+  运营者应保证服务器登录面仅限自己(租户只给受限 ssh 账号)。

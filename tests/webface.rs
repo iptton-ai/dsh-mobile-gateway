@@ -128,6 +128,7 @@ async fn spawn_env(web_hostname: &str, password_hash: &str) -> TestEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let state_for_web = state.clone();

@@ -37,6 +37,8 @@ pub struct AuthedDevice {
     pub device: String,
     /// 本令牌绑定的隧道端口(配对来源机器);None = 默认上游(密码登录令牌)。
     pub upstream_port: Option<u16>,
+    /// 本令牌归属租户(devices/revoke 的围栏键)。
+    pub tenant_id: String,
 }
 
 /// Handler 提取器:从 extensions 取出中间件鉴权结果。
@@ -92,10 +94,16 @@ impl LoginRateLimiter {
 
     /// 配对面专用:窗口更宽(输码是人工动作)。
     pub fn new_pairing() -> Self {
+        Self::new_limits(20, 300)
+    }
+
+    /// 自定义窗口/上限(公开面租户 admin:宽窗口容纳插件 3s 轮询,
+    /// 上限压密钥爆破)。
+    pub fn new_limits(max_attempts: usize, window_secs: u64) -> Self {
         Self {
             attempts: Mutex::new(HashMap::new()),
-            window: Duration::from_secs(300),
-            max_attempts: 20,
+            window: Duration::from_secs(window_secs),
+            max_attempts,
         }
     }
 
@@ -177,18 +185,20 @@ pub async fn login_handler(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("jwt encode: {e}")))?;
     state
         .db
-        .insert(&jti, &claims.device, None, "")
+        .insert(&jti, &claims.device, None, "", crate::tenant::DEFAULT_TENANT)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("db insert: {e}")))?;
     tracing::info!(ip = %ip, jti = %jti, "login ok");
     Ok(Json(LoginResponse { token, expires_at: exp }))
 }
 
+/// 本租户令牌清单(多租户围栏:看不到别家设备)。
 pub async fn devices_handler(
     State(state): State<Arc<AppState>>,
+    device: AuthedDevice,
 ) -> AppResult<Json<Vec<TokenRow>>> {
     let rows = state
         .db
-        .list()
+        .list_for_tenant(&device.tenant_id)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("db list: {e}")))?;
     Ok(Json(rows))
 }
@@ -198,15 +208,17 @@ pub async fn revoke_handler(
     device: AuthedDevice,
     Json(req): Json<RevokeRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    state
+    // 只能吊销本租户令牌;跨租户 jti 与未知 jti 同样返回 revoked:false,
+    // 不给「这个 jti 存在但属于别人」的探测面。
+    let ok = state
         .db
-        .revoke(&req.jti)
+        .revoke_in_tenant(&req.jti, &device.tenant_id)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("db revoke: {e}")))?;
-    tracing::info!(by = %device.jti, revoked = %req.jti, "token revoked");
-    Ok(Json(serde_json::json!({ "revoked": true })))
+    tracing::info!(by = %device.jti, revoked = %req.jti, ok, "token revoked");
+    Ok(Json(serde_json::json!({ "revoked": ok })))
 }
 
-/// Bearer JWT 校验 + 吊销检查 + 按令牌解析上游隧道端口。
+/// Bearer JWT 校验 + 吊销检查 + 按令牌解析上游隧道端口与租户。
 /// 所有中转请求(含 WS upgrade)与设备管理接口共用。
 pub async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -220,11 +232,14 @@ pub async fn auth_middleware(
         return Err(AppError::Unauthorized);
     }
     state.db.touch(&claims.jti);
-    let upstream_port = state.db.upstream_port_for(&claims.jti);
+    let Some((upstream_port, tenant_id)) = state.db.route_for(&claims.jti) else {
+        return Err(AppError::Unauthorized);
+    };
     req.extensions_mut().insert(AuthedDevice {
         jti: claims.jti,
         device: claims.device,
         upstream_port,
+        tenant_id,
     });
     Ok(next.run(req).await)
 }

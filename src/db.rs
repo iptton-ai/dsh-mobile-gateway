@@ -26,6 +26,8 @@ pub struct TokenRow {
     pub upstream_port: Option<u16>,
     /// 配对时的来源机器名(如 mac-mini);密码登录为空。
     pub host_label: String,
+    /// 归属租户(004;旧行迁移为 'default' = 运营者)。
+    pub tenant_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,9 @@ pub struct PairingRow {
     pub expires_at: i64,
     pub status: String, // pending | confirmed | expired
     pub token_jti: String,
+    /// 配对锚定的租户('' = 开放:任意租客可应约,手机人工核对主机码把关;
+    /// 非 '' = QR 邀请带 t= 参数锚定,只显示/接受该租户的 offers)。
+    pub tenant_id: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -50,6 +55,26 @@ pub struct ClaimRow {
     pub created_at: i64,
     pub expires_at: i64,
     pub status: String, // offered | consumed | expired
+    /// 应约方租户(令牌签发时继承为 tokens.tenant_id)。
+    pub tenant_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TenantRow {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub revoked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct HostRow {
+    pub id: String,
+    pub tenant_id: String,
+    pub label: String,
+    pub port: u16,
+    pub created_at: i64,
+    pub enabled: bool,
 }
 
 fn now() -> i64 {
@@ -74,9 +99,13 @@ impl TokenDb {
         conn.execute_batch(include_str!("../migrations/001_init.sql"))?;
         conn.execute_batch(include_str!("../migrations/002_pairing.sql"))?;
         conn.execute_batch(include_str!("../migrations/003_web.sql"))?;
-        // 001 的旧 tokens 表升级(已存在的部署):补列。幂等。
+        conn.execute_batch(include_str!("../migrations/004_multi_tenant.sql"))?;
+        // 旧表升级(已存在的部署):补列。幂等。
         ensure_column(&conn, "tokens", "upstream_port", "INTEGER")?;
         ensure_column(&conn, "tokens", "host_label", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "tokens", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
+        ensure_column(&conn, "pairings", "tenant_id", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "claims", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -88,14 +117,15 @@ impl TokenDb {
         device: &str,
         upstream_port: Option<u16>,
         host_label: &str,
+        tenant_id: &str,
     ) -> rusqlite::Result<()> {
         self.conn
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO tokens (jti, device, created_at, upstream_port, host_label) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![jti, device, now(), upstream_port, host_label],
+                "INSERT INTO tokens (jti, device, created_at, upstream_port, host_label, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![jti, device, now(), upstream_port, host_label, tenant_id],
             )
             .map(|_| ())
     }
@@ -105,6 +135,17 @@ impl TokenDb {
         let n = self.conn.lock().unwrap().execute(
             "UPDATE tokens SET revoked = 1 WHERE jti = ?1 AND revoked = 0",
             params![jti],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 租户围栏吊销:仅当目标令牌归属该租户才生效(跨租户 jti 一律 false,
+    /// 不区分「不存在」与「别人的」—— 不给探测面)。
+    pub fn revoke_in_tenant(&self, jti: &str, tenant_id: &str) -> rusqlite::Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE tokens SET revoked = 1 \
+             WHERE jti = ?1 AND revoked = 0 AND tenant_id = ?2",
+            params![jti, tenant_id],
         )?;
         Ok(n > 0)
     }
@@ -124,21 +165,24 @@ impl TokenDb {
         revoked == 0
     }
 
-    /// 令牌绑定的隧道端口(None = 默认上游;未知 jti 也 None,由吊销检查把关)。
-    pub fn upstream_port_for(&self, jti: &str) -> Option<u16> {
+    /// 令牌路由(隧道端口 + 租户;None = 未知/已吊销 jti,由吊销检查把关)。
+    pub fn route_for(&self, jti: &str) -> Option<(Option<u16>, String)> {
         self.conn
             .lock()
             .unwrap()
             .query_row(
-                "SELECT upstream_port FROM tokens WHERE jti = ?1 AND revoked = 0",
+                "SELECT upstream_port, tenant_id FROM tokens WHERE jti = ?1 AND revoked = 0",
                 params![jti],
-                |r| r.get::<_, Option<i64>>(0),
+                |r| {
+                    Ok((
+                        r.get::<_, Option<i64>>(0)?.map(|p| p as u16),
+                        r.get::<_, String>(1)?,
+                    ))
+                },
             )
             .optional()
             .ok()
             .flatten()
-            .flatten()
-            .map(|p| p as u16)
     }
 
     /// 按 jti 找配对来源机器(撤销提示用)。
@@ -167,8 +211,8 @@ impl TokenDb {
     pub fn list(&self) -> rusqlite::Result<Vec<TokenRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT jti, device, created_at, last_used_at, revoked, upstream_port, host_label \
-             FROM tokens ORDER BY created_at DESC",
+            "SELECT jti, device, created_at, last_used_at, revoked, upstream_port, host_label, \
+             tenant_id FROM tokens ORDER BY created_at DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -180,10 +224,16 @@ impl TokenDb {
                     revoked: r.get::<_, i64>(4)? != 0,
                     upstream_port: r.get::<_, Option<i64>>(5)?.map(|p| p as u16),
                     host_label: r.get(6)?,
+                    tenant_id: r.get(7)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 租户围栏清单(/auth/devices 数据源:只看本租户的设备)。
+    pub fn list_for_tenant(&self, tenant_id: &str) -> rusqlite::Result<Vec<TokenRow>> {
+        Ok(self.list()?.into_iter().filter(|t| t.tenant_id == tenant_id).collect())
     }
 
     // ── pairings(手机侧)────────────────────────────────────────────────
@@ -199,17 +249,19 @@ impl TokenDb {
         secret: &str,
         device: &str,
         ttl_secs: i64,
+        tenant_id: &str,
     ) -> rusqlite::Result<()> {
         self.pairing_sweep();
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "INSERT INTO pairings (id, code_d, secret, device, created_at, expires_at, status) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'pending' \
+            "INSERT INTO pairings (id, code_d, secret, device, created_at, expires_at, status, \
+             tenant_id) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?8 \
              WHERE NOT EXISTS (\
                SELECT 1 FROM pairings WHERE code_d = ?2 \
                AND (status = 'pending' OR created_at > ?7 - 1800)\
              )",
-            params![id, code_d, secret, device, now(), now() + ttl_secs, now()],
+            params![id, code_d, secret, device, now(), now() + ttl_secs, now(), tenant_id],
         )?;
         if n == 0 {
             return Err(rusqlite::Error::SqliteFailure(
@@ -225,7 +277,7 @@ impl TokenDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti \
+                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti, tenant_id \
                  FROM pairings WHERE id = ?1",
                 params![id],
                 row_pairing,
@@ -260,7 +312,7 @@ impl TokenDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti \
+                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti, tenant_id \
                  FROM pairings WHERE code_d = ?1 ORDER BY created_at DESC LIMIT 1",
                 params![code_d],
                 row_pairing,
@@ -290,6 +342,7 @@ impl TokenDb {
 
     // ── claims(Mac 侧)──────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub fn claim_insert(
         &self,
         id: &str,
@@ -298,14 +351,25 @@ impl TokenDb {
         host_label: &str,
         upstream_port: u16,
         ttl_secs: i64,
+        tenant_id: &str,
     ) -> rusqlite::Result<()> {
         self.conn
             .lock()
             .unwrap()
             .execute(
                 "INSERT INTO claims (id, pairing_code, host_code, host_label, upstream_port, \
-                 created_at, expires_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'offered')",
-                params![id, pairing_code, host_code, host_label, upstream_port, now(), now() + ttl_secs],
+                 created_at, expires_at, status, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'offered', ?8)",
+                params![
+                    id,
+                    pairing_code,
+                    host_code,
+                    host_label,
+                    upstream_port,
+                    now(),
+                    now() + ttl_secs,
+                    tenant_id
+                ],
             )
             .map(|_| ())
     }
@@ -316,7 +380,7 @@ impl TokenDb {
         let conn = self.conn.lock().unwrap();
         let Ok(mut stmt) = conn.prepare(
             "SELECT id, pairing_code, host_code, host_label, upstream_port, created_at, \
-             expires_at, status FROM claims \
+             expires_at, status, tenant_id FROM claims \
              WHERE pairing_code = ?1 AND status = 'offered' ORDER BY created_at",
         ) else {
             return Vec::new();
@@ -332,7 +396,7 @@ impl TokenDb {
             .unwrap()
             .query_row(
                 "SELECT id, pairing_code, host_code, host_label, upstream_port, created_at, \
-                 expires_at, status FROM claims WHERE id = ?1",
+                 expires_at, status, tenant_id FROM claims WHERE id = ?1",
                 params![id],
                 row_claim,
             )
@@ -356,7 +420,7 @@ impl TokenDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti \
+                "SELECT id, code_d, secret, device, created_at, expires_at, status, token_jti, tenant_id \
                  FROM pairings WHERE code_d = ?1 AND status = 'pending'",
                 params![code_d],
                 row_pairing,
@@ -364,6 +428,114 @@ impl TokenDb {
             .optional()
             .ok()
             .flatten()
+    }
+
+    // ── tenants / hosts(004 多租户)─────────────────────────────────────
+
+    pub fn tenant_insert(&self, id: &str, name: &str, admin_key_hash: &str) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO tenants (id, name, admin_key_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![id, name, admin_key_hash, now()],
+            )
+            .map(|_| ())
+    }
+
+    /// 按密钥摘要查活跃租户(公开面 /admin/* 鉴权路径)。
+    pub fn tenant_by_key(&self, admin_key_hash: &str) -> Option<TenantRow> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, name, created_at, revoked FROM tenants \
+                 WHERE admin_key_hash = ?1 AND revoked = 0",
+                params![admin_key_hash],
+                row_tenant,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn tenant_by_id(&self, id: &str) -> Option<TenantRow> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, name, created_at, revoked FROM tenants WHERE id = ?1",
+                params![id],
+                row_tenant,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn tenants_list(&self) -> rusqlite::Result<Vec<TenantRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, name, created_at, revoked FROM tenants ORDER BY created_at")?;
+        let rows = stmt
+            .query_map([], row_tenant)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 吊销租户(密钥立即失效);返回是否命中。
+    pub fn tenant_set_revoked(&self, id: &str, revoked: bool) -> rusqlite::Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE tenants SET revoked = ?2 WHERE id = ?1",
+            params![id, revoked as i64],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn host_insert(&self, id: &str, tenant_id: &str, label: &str, port: u16) -> rusqlite::Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO hosts (id, tenant_id, label, port, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, tenant_id, label, port, now()],
+            )
+            .map(|_| ())
+    }
+
+    /// 按端口查宿主登记(claim 归属仲裁)。
+    pub fn host_by_port(&self, port: u16) -> Option<HostRow> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id, tenant_id, label, port, created_at, enabled FROM hosts WHERE port = ?1",
+                params![port],
+                row_host,
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn hosts_list(&self) -> rusqlite::Result<Vec<HostRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, tenant_id, label, port, created_at, enabled FROM hosts ORDER BY port",
+        )?;
+        let rows = stmt.query_map([], row_host)?.collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// 删除宿主登记;返回是否命中。
+    pub fn host_remove(&self, id: &str) -> rusqlite::Result<bool> {
+        let n = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM hosts WHERE id = ?1", params![id])?;
+        Ok(n > 0)
     }
 
     // ── web_password(Web 面登录密码)──────────────────────────────────
@@ -419,6 +591,7 @@ fn row_pairing(r: &rusqlite::Row<'_>) -> rusqlite::Result<PairingRow> {
         expires_at: r.get(5)?,
         status: r.get(6)?,
         token_jti: r.get(7)?,
+        tenant_id: r.get(8)?,
     })
 }
 
@@ -432,6 +605,27 @@ fn row_claim(r: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRow> {
         created_at: r.get(5)?,
         expires_at: r.get(6)?,
         status: r.get(7)?,
+        tenant_id: r.get(8)?,
+    })
+}
+
+fn row_tenant(r: &rusqlite::Row<'_>) -> rusqlite::Result<TenantRow> {
+    Ok(TenantRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        created_at: r.get(2)?,
+        revoked: r.get::<_, i64>(3)? != 0,
+    })
+}
+
+fn row_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRow> {
+    Ok(HostRow {
+        id: r.get(0)?,
+        tenant_id: r.get(1)?,
+        label: r.get(2)?,
+        port: r.get::<_, i64>(3)? as u16,
+        created_at: r.get(4)?,
+        enabled: r.get::<_, i64>(5)? != 0,
     })
 }
 

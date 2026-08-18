@@ -93,6 +93,7 @@ async fn spawn_env(upstreams: usize, with_password: bool) -> PairEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,6 +493,7 @@ async fn relay_prefers_unix_socket_when_present() {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let pl = TcpListener::bind("127.0.0.1:0").await.unwrap();

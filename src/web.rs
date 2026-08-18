@@ -284,6 +284,7 @@ async fn web_relay(
         req.headers_mut().remove(header::AUTHORIZATION);
         let device = AuthedDevice {
             jti: "web-anon".into(),
+            tenant_id: crate::tenant::DEFAULT_TENANT.into(),
             device: "web".into(),
             upstream_port: state.config.web_upstream_port,
         };
@@ -309,6 +310,7 @@ async fn web_relay(
     req.headers_mut().remove("sec-fetch-site");
     let device = AuthedDevice {
         jti: session.0,
+        tenant_id: crate::tenant::DEFAULT_TENANT.into(),
         device: "web".into(),
         upstream_port: state.config.web_upstream_port,
     };

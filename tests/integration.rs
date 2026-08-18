@@ -119,6 +119,7 @@ async fn spawn_all() -> TestEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let gateway_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -313,6 +314,7 @@ async fn healthz_reports_upstream() {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -492,6 +494,7 @@ async fn admin_routes_require_bearer_token_when_configured() {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();

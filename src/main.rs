@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         db,
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
 

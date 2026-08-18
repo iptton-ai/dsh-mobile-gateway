@@ -42,6 +42,7 @@ async fn spawn_all() -> QrEnv {
         db: TokenDb::open_in_memory().unwrap(),
         login_limiter: LoginRateLimiter::new(),
         pair_limiter: LoginRateLimiter::new_pairing(),
+        admin_limiter: LoginRateLimiter::new_limits(300, 300),
         ws_sessions: Default::default(),
     });
     let pub_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

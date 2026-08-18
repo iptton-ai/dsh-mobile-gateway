@@ -18,6 +18,7 @@ use gateway_shared::jwt::encode_jwt;
 
 use crate::auth::{client_ip, GatewayClaims};
 use crate::db::ClaimRow;
+use crate::tenant::{TenantCtx, DEFAULT_TENANT};
 use crate::AppState;
 
 /// pending 配对存活期(手机亮码等人来输,给足输入时间)。
@@ -38,6 +39,10 @@ pub struct PairStartRequest {
     pub secret: String,
     #[serde(default)]
     pub device: String,
+    /// 租户锚定(QR 邀请 t= 参数;空 = 开放配对,任意租户可应约,
+    /// 手机人工核对主机码把关)。必须是已登记的活跃租户。
+    #[serde(default)]
+    pub tenant: String,
 }
 
 #[derive(Serialize)]
@@ -84,6 +89,9 @@ pub struct PairConfirmResponse {
     pub expires_at: i64,
     /// 令牌绑定的来源机器(回显给手机端人工核对)。
     pub host_label: String,
+    /// 来源宿主的稳定标识(rust 形态 = 隧道端口字符串)。App 主机簿以此
+    /// 做复合键:同一网关后面的不同宿主 = 不同条目,同宿主重配 = 原地刷新。
+    pub host_ref: String,
 }
 
 #[derive(Deserialize)]
@@ -143,12 +151,27 @@ pub async fn start_handler(
     }
     let id = uuid::Uuid::new_v4().to_string();
     let expires_at = Utc::now().timestamp() + PAIRING_TTL_SECS;
+    // 租户锚定:必须是活跃租户(或留空 = 开放配对)。未知租户直接 400,
+    // 不给「枚举租户 id 是否存在」之外的信号 —— 存在性本身即公开事实
+    // (QR 里本来就带)。
+    let tenant = req.tenant.trim().to_ascii_lowercase();
+    if !tenant.is_empty() {
+        if tenant == DEFAULT_TENANT
+            || !(4..=32).contains(&tenant.len())
+            || !tenant.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(AppError::BadRequest("invalid tenant".into()));
+        }
+        if state.db.tenant_by_id(&tenant).is_none() {
+            return Err(AppError::BadRequest("unknown tenant".into()));
+        }
+    }
     // 同码存活 pending 唯一:后到者 409(手机端换码重试)。
     state
         .db
-        .pairing_insert(&id, &code, &req.secret, &req.device, PAIRING_TTL_SECS)
+        .pairing_insert(&id, &code, &req.secret, &req.device, PAIRING_TTL_SECS, &tenant)
         .map_err(|_| AppError::Conflict("code already in use; generate a new one".into()))?;
-    tracing::info!(ip = %ip, code = %code, "pairing started");
+    tracing::info!(ip = %ip, code = %code, tenant = %tenant, "pairing started");
     Ok(Json(PairStartResponse { pairing_id: id, expires_at }))
 }
 
@@ -168,10 +191,13 @@ pub async fn poll_handler(
     if p.status == "confirmed" {
         return Ok(Json(PairPollResponse { status: "confirmed".into(), offers: vec![] }));
     }
+    // 租户锚定的配对只显示该租户的 offers(跨租户 Mac 的应约不可见;
+    // 开放配对 '' 显示全部,confirm 侧再按 claim 租户围栏)。
     let offers: Vec<PairOffer> = state
         .db
         .claims_for(&p.code_d)
         .into_iter()
+        .filter(|c| p.tenant_id.is_empty() || c.tenant_id == p.tenant_id)
         .map(|c: ClaimRow| PairOffer {
             claim_id: c.id,
             host_code: c.host_code,
@@ -211,6 +237,11 @@ pub async fn confirm_handler(
     if claim.pairing_code != p.code_d || claim.status != "offered" {
         return Err(AppError::BadRequest("claim not applicable".into()));
     }
+    // 锚定配对的深度防御:应约方租户必须与锚定一致(poll 已过滤,
+    // 这里再拦一次直发 confirm 的绕道)。
+    if !p.tenant_id.is_empty() && claim.tenant_id != p.tenant_id {
+        return Err(AppError::BadRequest("claim not applicable".into()));
+    }
     if claim.expires_at < Utc::now().timestamp() {
         return Err(AppError::BadRequest("claim expired".into()));
     }
@@ -239,24 +270,28 @@ pub async fn confirm_handler(
         .map_err(|e| AppError::Internal(anyhow::anyhow!("jwt encode: {e}")))?;
     state
         .db
-        .insert(&jti, &p.device, Some(claim.upstream_port), &claim.host_label)
+        .insert(&jti, &p.device, Some(claim.upstream_port), &claim.host_label, &claim.tenant_id)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("db insert: {e}")))?;
     tracing::info!(
         ip = %ip, jti = %jti, device = %p.device,
-        host = %claim.host_label, port = claim.upstream_port,
+        host = %claim.host_label, port = claim.upstream_port, tenant = %claim.tenant_id,
         "paired (token bound to tunnel port)"
     );
     Ok(Json(PairConfirmResponse {
         token,
         expires_at: exp,
         host_label: claim.host_label,
+        host_ref: claim.upstream_port.to_string(),
     }))
 }
 
-// ── 管理面(仅 127.0.0.1 admin 监听;pair.sh 经 ssh 调用)─────────────────
+// ── 管理面(双入口共用同一组 handler)────────────────────────────────────
+// - 8103 loopback(env token/ssh):运营者超管 ctx,可跨租户;
+// - 公开面 /admin/*(tenant_auth_middleware):租户 ctx,全部围栏在本租户。
 
 pub async fn admin_claim_handler(
     State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<TenantCtx>,
     Json(req): Json<AdminClaimRequest>,
 ) -> AppResult<Json<AdminClaimResponse>> {
     let code = req.code.trim().to_ascii_uppercase().replace(['-', ' ', ':'], "");
@@ -267,17 +302,52 @@ pub async fn admin_claim_handler(
     if !valid_host_code(&host_code) {
         return Err(AppError::BadRequest("host_code must be 6-7 chars".into()));
     }
-    let port = req.port.unwrap_or_else(|| state.config.default_tunnel_port());
-    if !(state.config.tunnel_port_min..=state.config.tunnel_port_max).contains(&port) {
-        return Err(AppError::BadRequest(format!(
-            "tunnel port must be {}-{}",
-            state.config.tunnel_port_min, state.config.tunnel_port_max
-        )));
-    }
     // 必须有手机在等这个码(不创建悬空 offer)。
     let Some(pending) = state.db.pairing_by_code(&code) else {
         return Err(AppError::NotFound("no phone waiting with this code".into()));
     };
+    // 应约方租户:租户 ctx 恒为本租户(锚定到别家的配对按「无人在等」拒,
+    // 不给探测面);运营者跟随配对锚定(无锚定 = default)。
+    let ctx_tenant = if ctx.operator {
+        if pending.tenant_id.is_empty() {
+            DEFAULT_TENANT.to_string()
+        } else {
+            pending.tenant_id.clone()
+        }
+    } else {
+        if !pending.tenant_id.is_empty() && pending.tenant_id != ctx.id {
+            return Err(AppError::NotFound("no phone waiting with this code".into()));
+        }
+        ctx.id.clone()
+    };
+    let port = req.port.unwrap_or_else(|| state.config.default_tunnel_port());
+    // 端口归属仲裁:登记过的端口必须归属本租户且启用;未登记端口仅
+    // 运营者/default 沿用范围白名单(单运营者旧部署零迁移),显式租户
+    // 必须先由运营者登记宿主 —— 否则「能 bind 该端口的进程就是上游」。
+    match state.db.host_by_port(port) {
+        Some(h) if !h.enabled => {
+            return Err(AppError::Forbidden("host disabled".into()));
+        }
+        Some(h) if h.tenant_id != ctx_tenant => {
+            return Err(AppError::Forbidden("tunnel port owned by another host".into()));
+        }
+        Some(_) => {}
+        None => {
+            let legacy_ok =
+                ctx.operator || ctx_tenant == DEFAULT_TENANT;
+            if !legacy_ok {
+                return Err(AppError::Forbidden(
+                    "no host registered for this port; ask the operator to register it".into(),
+                ));
+            }
+            if !(state.config.tunnel_port_min..=state.config.tunnel_port_max).contains(&port) {
+                return Err(AppError::BadRequest(format!(
+                    "tunnel port must be {}-{}",
+                    state.config.tunnel_port_min, state.config.tunnel_port_max
+                )));
+            }
+        }
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let host_label = if req.host_label.is_empty() {
         "mac".to_string()
@@ -286,9 +356,9 @@ pub async fn admin_claim_handler(
     };
     state
         .db
-        .claim_insert(&id, &code, &host_code, &host_label, port, CLAIM_TTL_SECS)
+        .claim_insert(&id, &code, &host_code, &host_label, port, CLAIM_TTL_SECS, &ctx_tenant)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("claim insert: {e}")))?;
-    tracing::info!(code = %code, host = %host_label, port, "pair claim offered");
+    tracing::info!(code = %code, host = %host_label, port, tenant = %ctx_tenant, "pair claim offered");
     Ok(Json(AdminClaimResponse {
         claim_id: id,
         device: pending.device,
@@ -306,19 +376,24 @@ pub struct AdminRevokeRequest {
 
 pub async fn admin_revoke_token_handler(
     State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<TenantCtx>,
     Json(req): Json<AdminRevokeRequest>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let ok = state
-        .db
-        .revoke(&req.jti)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("db revoke: {e}")))?;
-    tracing::warn!(jti = %req.jti, ok, "admin revoke-token");
+    let ok = if ctx.operator {
+        state.db.revoke(&req.jti)
+    } else {
+        state.db.revoke_in_tenant(&req.jti, &ctx.id)
+    }
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("db revoke: {e}")))?;
+    tracing::warn!(jti = %req.jti, ok, tenant = %ctx.id, "admin revoke-token");
     Ok(Json(serde_json::json!({ "revoked": ok })))
 }
 
 /// pair.sh 轮询:配对是否被手机确认(完成时回显设备名供人眼核对)。
+/// 租户 ctx 只能看到锚定本租户/开放的配对;token 只回显本租户签发的。
 pub async fn admin_status_handler(
     State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<TenantCtx>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> AppResult<Json<serde_json::Value>> {
     let Some(code) = q.get("code") else {
@@ -328,6 +403,10 @@ pub async fn admin_status_handler(
     let Some((p, token)) = state.db.pairing_status_with_token(&code) else {
         return Err(AppError::NotFound("no pairing with this code".into()));
     };
+    if !ctx.operator && !p.tenant_id.is_empty() && p.tenant_id != ctx.id {
+        return Err(AppError::NotFound("no pairing with this code".into()));
+    }
+    let token = token.filter(|t| ctx.operator || t.tenant_id == ctx.id);
     Ok(Json(serde_json::json!({
         "status": p.status,
         "device": p.device,
@@ -337,6 +416,8 @@ pub async fn admin_status_handler(
             "device": t.device,
             "host_label": t.host_label,
             "upstream_port": t.upstream_port,
+            "host_ref": t.upstream_port.map(|p| p.to_string()),
+            "tenant_id": t.tenant_id,
             "revoked": t.revoked,
             "created_at": t.created_at,
         })),
@@ -345,13 +426,17 @@ pub async fn admin_status_handler(
 
 /// 管理面令牌清单(pair.sh 异常撤销提示的可操作化)。
 /// 每行附 `connected`:该令牌当前是否持有下行 WS(在线)—— 侧栏在线指示器数据源。
+/// 租户 ctx 只列本租户令牌;每行带 upstream_port/host_ref 供插件按本机身份过滤。
 pub async fn admin_tokens_handler(
     State(state): State<Arc<AppState>>,
+    axum::Extension(ctx): axum::Extension<TenantCtx>,
 ) -> AppResult<Json<serde_json::Value>> {
-    let rows = state
-        .db
-        .list()
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("db list: {e}")))?;
+    let rows = if ctx.operator {
+        state.db.list()
+    } else {
+        state.db.list_for_tenant(&ctx.id)
+    }
+    .map_err(|e| AppError::Internal(anyhow::anyhow!("db list: {e}")))?;
     let online = state.ws_online();
     let out = rows
         .into_iter()
@@ -359,6 +444,7 @@ pub async fn admin_tokens_handler(
             let mut v = serde_json::to_value(&r)
                 .map_err(|e| AppError::Internal(anyhow::anyhow!("serialize token: {e}")))?;
             v["connected"] = serde_json::Value::Bool(online.contains(&r.jti));
+            v["host_ref"] = serde_json::json!(r.upstream_port.map(|p| p.to_string()));
             Ok(v)
         })
         .collect::<Result<Vec<_>, AppError>>()?;
